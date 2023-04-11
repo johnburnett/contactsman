@@ -106,7 +106,7 @@ def read_all_vcards(input_path: str) -> dict[str, list[VCard]]:
 
     input_vcards = {}
     for input_file_path in iter_func(input_path):
-        info(f'Reading "{input_file_path}"')
+        debug(f'Reading "{input_file_path}"')
         input_vcards[input_file_path] = read_vcards(input_file_path)
     return input_vcards
 
@@ -137,7 +137,7 @@ def write_all_vcards(output_vcards: dict[str, list[VCard]], output_path: str) ->
 
     iter_func = iter_output_dir if os.path.isdir(output_path) else iter_output_file
     for output_file_path, vcards in iter_func(output_vcards, output_path):
-        info(f'Writing "{output_file_path}"')
+        debug(f'Writing "{output_file_path}"')
         write_vcards(output_file_path, vcards)
 
 
@@ -459,8 +459,9 @@ def cmd_fullsync(args: argparse.Namespace) -> NoReturn:
     info(f'Scraping contacts from "{args.contacts_root_dir}"')
     persons = [
         Person.from_vcard(vcard)
-        for vcard in vcards
-        for _, vcards in read_all_vcards(args.contacts_root_dir).items()
+        for vcard in itertools.chain.from_iterable(
+            [vcards for vcards in read_all_vcards(args.contacts_root_dir).values()]
+        )
     ]
     info(f'Found {len(persons)} contacts')
     create_google_contacts(papi, persons)
