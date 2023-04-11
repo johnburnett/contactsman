@@ -1,12 +1,15 @@
 from __future__ import annotations
+import argparse
 import base64
 from collections import defaultdict
+import itertools
 import io
 import os
 import sys
 from typing import (
     Any,
     Iterator,
+    NoReturn,
     Optional,
 )
 import uuid
@@ -43,7 +46,7 @@ except ImportError:
     from pprint import pprint
 
 
-def fatal(*args, **kwargs):
+def fatal(*args, **kwargs) -> NoReturn:
     print(*args, **kwargs)
     sys.exit(1)
 
@@ -52,12 +55,26 @@ def chunks(seq: Sequence[Any], size: int) -> Iterator[list[Any]]:
     return [seq[pos : pos + size] for pos in range(0, len(seq), size)]
 
 
-def iter_vcards(file_path: str) -> Iterator[VCard]:
+def read_vcards(file_path: str) -> list[Person]:
+    vcards = []
     with open(file_path, encoding='utf-8') as fp:
         components = vobject.readComponents(fp)
         for component in components:
             if component.name == 'VCARD':
-                yield component
+                vcards.append(component)
+    return vcards
+
+
+def read_all_vcards(root_dir_path: str) -> list[Person]:
+    all_vcards = []
+    for dir_path, dir_names, file_names in os.walk(root_dir_path):
+        for file_name in file_names:
+            if os.path.splitext(file_name)[-1].lower() != '.vcf':
+                continue
+            file_path = os.path.join(dir_path, file_name)
+            vcards = read_vcards(file_path)
+            all_vcards.extend(vcards)
+    return all_vcards
 
 
 def write_vcards(file_path: str, vcards: Sequence[VCard]) -> None:
@@ -83,7 +100,7 @@ def get_multi_param(params: dict[str, list[Any, ...]], name: str) -> list[Any]:
         return param if isinstance(param, list) else [param]
 
 
-def constrain_card_photo(photo_prop: VCardProperty) -> bool:
+def fix_card_photo(photo_prop: VCardProperty) -> bool:
     '''Constrain size/dimensions of a vcard photo according to the
     (undocumented?) rules that Apple applies to its contacts.
     '''
@@ -255,6 +272,35 @@ class Person:
         return hash(self.uid)
 
 
+################################################################################
+
+
+def get_google_credentials() -> Optional[Credentials]:
+    creds = None
+    token_file_path = os.path.join(THIS_DIR_PATH, GOOGLE_TOKEN_FILE_NAME)
+    if os.path.exists(token_file_path):
+        creds = Credentials.from_authorized_user_file(token_file_path, GOOGLE_SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            secrets_file_path = os.path.join(THIS_DIR_PATH, GOOGLE_SECRET_FILE_NAME)
+            flow = InstalledAppFlow.from_client_secrets_file(secrets_file_path, GOOGLE_SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open(token_file_path, 'w', encoding='utf-8') as fp:
+            fp.write(creds.to_json())
+    return creds
+
+
+def hey_papi() -> googleapiclient.discovery.Resource:
+    creds = get_google_credentials()
+    if not creds:
+        fatal('Unable to get Google credentials')
+    service = googleapiclient.discovery.build('people', 'v1', credentials=creds)
+    papi = service.people()
+    return papi
+
+
 def contact_info_from_person(person: Person) -> dict[str, Any]:
     '''Creates a dict that contains the info that Google People API can ingest.'''
     ci = {}
@@ -279,48 +325,6 @@ def contact_info_from_person(person: Person) -> dict[str, Any]:
         ci['phoneNumbers'].append({'type': label, 'value': phone_number})
 
     return ci
-
-
-################################################################################
-
-
-def parse_all_vcards(root_dir_path: str) -> list[Person]:
-    persons = []
-    for dir_path, dir_names, file_names in os.walk(root_dir_path):
-        for file_name in file_names:
-            if os.path.splitext(file_name)[-1].lower() != '.vcf':
-                continue
-            file_path = os.path.join(dir_path, file_name)
-            vcards = iter_vcards(file_path)
-            for vcard in vcards:
-                person = Person.from_vcard(vcard)
-                persons.append(person)
-    return persons
-
-
-def constrain_all_card_photos(input_file_path: str, output_file_path: str) -> None:
-    vcards = list(iter_vcards(input_file_path))
-    for vcard in vcards:
-        if hasattr(vcard, 'photo') and constrain_card_photo(vcard.photo):
-            info('optimized', vcard.fn.value)
-    write_vcards(output_file_path, vcards)
-
-
-def get_google_credentials() -> Optional[Credentials]:
-    creds = None
-    token_file_path = os.path.join(THIS_DIR_PATH, GOOGLE_TOKEN_FILE_NAME)
-    if os.path.exists(token_file_path):
-        creds = Credentials.from_authorized_user_file(token_file_path, GOOGLE_SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            secrets_file_path = os.path.join(THIS_DIR_PATH, GOOGLE_SECRET_FILE_NAME)
-            flow = InstalledAppFlow.from_client_secrets_file(secrets_file_path, GOOGLE_SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open(token_file_path, 'w', encoding='utf-8') as fp:
-            fp.write(creds.to_json())
-    return creds
 
 
 def load_all_google_contacts(papi: googleapiclient.discovery.Resource) -> list[dict[str, Any]]:
@@ -362,7 +366,7 @@ def create_google_contacts(
     for ii, persons_chunk in enumerate(chunks(persons, GOOGLE_BATCH_CREATE_LIMIT)):
         start_index = ii * GOOGLE_BATCH_CREATE_LIMIT
         end_index = start_index + GOOGLE_BATCH_CREATE_LIMIT - 1
-        info(f'Creating persons {start_index}-{end_index} of {len(persons_chunk)} total persons')
+        info(f'Creating persons {start_index}-{end_index} of {len(persons)} total persons')
         contacts = [{'contactPerson': contact_info_from_person(person)} for person in persons_chunk]
         body = {'contacts': contacts, 'readMask': 'names'}
         request = papi.batchCreateContacts(body=body)
@@ -372,17 +376,98 @@ def create_google_contacts(
 ################################################################################
 
 
-def main():
-    contacts_root_dir = sys.argv[1]
+def cmd_fullsync(args: argparse.Namespace) -> NoReturn:
+    papi = hey_papi()
+    info('Deleting contacts...', end='\n')
+    deleted_resource_names = sorted(delete_all_google_contacts(papi))
+    for name in deleted_resource_names:
+        info(name)
+    info(f'Deleted {len(deleted_resource_names)} contacts')
+    info(f'Scraping contacts from "{args.contacts_root_dir}"')
+    vcards = read_all_vcards(args.contacts_root_dir)
+    info(f'Found {len(persons)} contacts')
+    persons = [Person.from_vcard(vcard) for vcard in vcards]
+    create_google_contacts(papi, persons)
+    sys.exit(0)
 
-    creds = get_google_credentials()
-    if not creds:
-        fatal('Unable to get Google credentials')
-        return
 
-    service = googleapiclient.discovery.build('people', 'v1', credentials=creds)
-    papi = service.people()
+def cmd_fixphotos(args: argparse.Namespace) -> NoReturn:
+    def iter_input_dir(input_dir_path) -> Iterator[str]:
+        assert os.path.isdir(input_dir_path)
+        for dir_path, dir_names, file_names in os.walk(input_dir_path):
+            for file_name in file_names:
+                if os.path.splitext(file_name)[-1].lower() == '.vcf':
+                    yield os.path.join(dir_path, file_name)
 
+    def iter_input_file(input_file_path) -> Iterator[str]:
+        yield input_file_path
+
+    def iter_output_dir(
+        input_vcards: dict[str, list[VCard]], output_dir_path: str
+    ) -> Iterator[tuple(str, list[VCard])]:
+        for input_file_path, vcards in input_vcards.items():
+            input_file_name = os.path.basename(input_file_path)
+            output_file_path = os.path.join(output_dir_path, input_file_name)
+            yield (output_file_path, vcards)
+
+    def iter_output_file(
+        input_vcards: dict[str, list[VCard]], output_file_path: str
+    ) -> Iterator[tuple(str, list[VCard])]:
+        all_vcards = itertools.chain.from_iterable(input_vcards.values())
+        yield (output_file_path, all_vcards)
+
+    iter_input = iter_input_dir if os.path.isdir(args.input_path) else iter_input_file
+    iter_output = iter_output_dir if os.path.isdir(args.output_path) else iter_output_file
+
+    input_cards = {}
+    for input_file_path in iter_input(args.input_path):
+        info(f'Reading "{input_file_path}"')
+        input_cards[input_file_path] = read_vcards(input_file_path)
+
+    for input_file_path, vcards in input_cards.items():
+        for vcard in vcards:
+            if hasattr(vcard, 'photo') and 'uri' not in vcard.photo.params.get('VALUE', []):
+                if fix_card_photo(vcard.photo):
+                    info('optimized', vcard.fn.value)
+
+    for output_file_path, vcards in iter_output(input_cards, args.output_path):
+        info(f'Writing "{output_file_path}"')
+        write_vcards(output_file_path, vcards)
+
+    sys.exit(0)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.set_defaults(func=lambda _: parser.print_usage(file=sys.stdout))
+    subparsers = parser.add_subparsers()
+
+    sp = subparsers.add_parser('fullsync')
+    sp.add_argument('contacts_root_dir')
+    sp.set_defaults(func=cmd_fullsync)
+
+    sp = subparsers.add_parser(
+        'fixphotos',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+input_path and output_path can be a file path or a directory path.  The
+behavior is as follows:
+
+    input=file, output=file -> file to file
+    input=dir,  output=file -> write all cards to one file
+    input=file, output=dir  -> write to same-named file
+    input=dir,  output=dir  -> write all files to same-named files
+    ''',
+    )
+    sp.add_argument('input_path')
+    sp.add_argument('output_path')
+    sp.set_defaults(func=cmd_fixphotos)
+
+    args = parser.parse_args()
+    return args
+
+
+def main() -> NoReturn:
     ############################################################################
     # Map from a vcard UID to google resource name, if we ever want to mess
     # with gently updating existing contacts vs existing lazy scorched earth
@@ -417,14 +502,8 @@ def main():
     #         )
     #         response = request.execute()
 
-    ############################################################################
-    info('Deleting contacts:')
-    for name in sorted(delete_all_google_contacts(papi)):
-        info(name)
-    info(f'Scraping contacts from "{contacts_root_dir}"')
-    persons = parse_all_vcards(contacts_root_dir)
-    info(f'Found {len(persons)} contacts')
-    create_google_contacts(papi, persons)
+    args = parse_args()
+    args.func(args)
 
 
 if __name__ == '__main__':
