@@ -24,6 +24,19 @@ import vobject
 
 THIS_DIR_PATH = os.path.dirname(os.path.normpath(__file__))
 
+INPUT_OUTPUT_PATH_HELP = '''
+input_path and output_path can be a file path or a directory path.
+Cards will be combined into a single file or split apart into multiple
+files as needed.  The behavior is as follows:
+
+    input=file, output=file -> file to file
+    input=dir,  output=file -> write all cards to one file
+    input=file, output=dir  -> write to same-named file
+    input=dir,  output=dir  -> write all files to same-named files
+
+If input is a directory, vcf files in all sub-dirs will be found.
+'''
+
 GOOGLE_SCOPES = ['https://www.googleapis.com/auth/contacts']
 GOOGLE_TOKEN_FILE_NAME = 'google_token.json'
 GOOGLE_SECRET_FILE_NAME = 'google_client_secret.json'
@@ -55,7 +68,7 @@ def chunks(seq: Sequence[Any], size: int) -> Iterator[list[Any]]:
     return [seq[pos : pos + size] for pos in range(0, len(seq), size)]
 
 
-def read_vcards(file_path: str) -> list[Person]:
+def read_vcards(file_path: str) -> list[VCard]:
     vcards = []
     with open(file_path, encoding='utf-8') as fp:
         components = vobject.readComponents(fp)
@@ -65,22 +78,67 @@ def read_vcards(file_path: str) -> list[Person]:
     return vcards
 
 
-def read_all_vcards(root_dir_path: str) -> list[Person]:
-    all_vcards = []
-    for dir_path, dir_names, file_names in os.walk(root_dir_path):
-        for file_name in file_names:
-            if os.path.splitext(file_name)[-1].lower() != '.vcf':
-                continue
-            file_path = os.path.join(dir_path, file_name)
-            vcards = read_vcards(file_path)
-            all_vcards.extend(vcards)
-    return all_vcards
-
-
 def write_vcards(file_path: str, vcards: Sequence[VCard]) -> None:
     with open(file_path, 'w', newline='\n', encoding='utf-8') as fp:
         for vcard in vcards:
             vcard.serialize(fp)
+
+
+def read_all_vcards(input_path: str) -> dict[str, list[VCard]]:
+    '''Given a path, return a mapping from found vcf files to the list of VCard
+    instances each vcf file contains.
+
+    If input_path is a file, it will read just that file.
+    If input_path is a directory, it will recursively read all found vcf files.
+    '''
+
+    def iter_input_dir(input_dir_path) -> Iterator[str]:
+        assert os.path.isdir(input_dir_path)
+        for dir_path, dir_names, file_names in os.walk(input_dir_path):
+            for file_name in file_names:
+                if os.path.splitext(file_name)[-1].lower() == '.vcf':
+                    yield os.path.join(dir_path, file_name)
+
+    def iter_input_file(input_file_path) -> Iterator[str]:
+        yield input_file_path
+
+    iter_func = iter_input_dir if os.path.isdir(input_path) else iter_input_file
+
+    input_vcards = {}
+    for input_file_path in iter_func(input_path):
+        info(f'Reading "{input_file_path}"')
+        input_vcards[input_file_path] = read_vcards(input_file_path)
+    return input_vcards
+
+
+def write_all_vcards(output_vcards: dict[str, list[VCard]], output_path: str) -> None:
+    '''Given a mapping from input file paths to VCard (as returned by
+    read_all_vcards), and an output path, write out the VCards.
+
+    If output_path is a file, all VCards will be writtent o that file.
+    If output_path is a directory, each set of VCards will be written to a
+    file in the directory with a name that matches the filename it was
+    originally read from.
+    '''
+
+    def iter_output_dir(
+        output_vcards: dict[str, list[VCard]], output_dir_path: str
+    ) -> Iterator[tuple(str, list[VCard])]:
+        for input_file_path, vcards in output_vcards.items():
+            input_file_name = os.path.basename(input_file_path)
+            output_file_path = os.path.join(output_dir_path, input_file_name)
+            yield (output_file_path, vcards)
+
+    def iter_output_file(
+        output_vcards: dict[str, list[VCard]], output_file_path: str
+    ) -> Iterator[tuple(str, list[VCard])]:
+        all_vcards = itertools.chain.from_iterable(output_vcards.values())
+        yield (output_file_path, all_vcards)
+
+    iter_func = iter_output_dir if os.path.isdir(output_path) else iter_output_file
+    for output_file_path, vcards in iter_func(output_vcards, output_path):
+        info(f'Writing "{output_file_path}"')
+        write_vcards(output_file_path, vcards)
 
 
 def get_single_param(params: dict[str, list[Any]], name: str) -> Any:
@@ -98,6 +156,21 @@ def get_multi_param(params: dict[str, list[Any, ...]], name: str) -> list[Any]:
         return []
     else:
         return param if isinstance(param, list) else [param]
+
+
+def get_vcard_photo_type(vcard: VCard) -> Optional[str]:
+    '''Return one of:
+    None
+    'inline'
+    'link'
+    '''
+    if hasattr(vcard, 'photo'):
+        value = get_single_param(vcard.photo.params, 'VALUE')
+        if value and 'uri' in value:
+            return 'link'
+        else:
+            return 'inline'
+    return None
 
 
 def fix_card_photo(photo_prop: VCardProperty) -> bool:
@@ -384,56 +457,41 @@ def cmd_fullsync(args: argparse.Namespace) -> NoReturn:
         info(name)
     info(f'Deleted {len(deleted_resource_names)} contacts')
     info(f'Scraping contacts from "{args.contacts_root_dir}"')
-    vcards = read_all_vcards(args.contacts_root_dir)
+    persons = [
+        Person.from_vcard(vcard)
+        for vcard in vcards
+        for _, vcards in read_all_vcards(args.contacts_root_dir).items()
+    ]
     info(f'Found {len(persons)} contacts')
-    persons = [Person.from_vcard(vcard) for vcard in vcards]
     create_google_contacts(papi, persons)
     sys.exit(0)
 
 
+def cmd_rewritecards(args: argparse.Namespace) -> NoReturn:
+    input_vcards = read_all_vcards(args.input_path)
+    write_all_vcards(input_vcards, args.output_path)
+    sys.exit(0)
+
+
 def cmd_fixphotos(args: argparse.Namespace) -> NoReturn:
-    def iter_input_dir(input_dir_path) -> Iterator[str]:
-        assert os.path.isdir(input_dir_path)
-        for dir_path, dir_names, file_names in os.walk(input_dir_path):
-            for file_name in file_names:
-                if os.path.splitext(file_name)[-1].lower() == '.vcf':
-                    yield os.path.join(dir_path, file_name)
+    input_vcards = read_all_vcards(args.input_path)
 
-    def iter_input_file(input_file_path) -> Iterator[str]:
-        yield input_file_path
-
-    def iter_output_dir(
-        input_vcards: dict[str, list[VCard]], output_dir_path: str
-    ) -> Iterator[tuple(str, list[VCard])]:
-        for input_file_path, vcards in input_vcards.items():
-            input_file_name = os.path.basename(input_file_path)
-            output_file_path = os.path.join(output_dir_path, input_file_name)
-            yield (output_file_path, vcards)
-
-    def iter_output_file(
-        input_vcards: dict[str, list[VCard]], output_file_path: str
-    ) -> Iterator[tuple(str, list[VCard])]:
-        all_vcards = itertools.chain.from_iterable(input_vcards.values())
-        yield (output_file_path, all_vcards)
-
-    iter_input = iter_input_dir if os.path.isdir(args.input_path) else iter_input_file
-    iter_output = iter_output_dir if os.path.isdir(args.output_path) else iter_output_file
-
-    input_cards = {}
-    for input_file_path in iter_input(args.input_path):
-        info(f'Reading "{input_file_path}"')
-        input_cards[input_file_path] = read_vcards(input_file_path)
-
-    for input_file_path, vcards in input_cards.items():
+    for input_file_path, vcards in input_vcards.items():
         for vcard in vcards:
-            if hasattr(vcard, 'photo') and 'uri' not in vcard.photo.params.get('VALUE', []):
+            if get_vcard_photo_type(vcard) == 'inline':
                 if fix_card_photo(vcard.photo):
                     info('optimized', vcard.fn.value)
 
-    for output_file_path, vcards in iter_output(input_cards, args.output_path):
-        info(f'Writing "{output_file_path}"')
-        write_vcards(output_file_path, vcards)
+    write_all_vcards(input_vcards, args.output_path)
+    sys.exit(0)
 
+
+def cmd_test(args: argparse.Namespace) -> NoReturn:
+    for file_path, vcards in read_all_vcards(args.dir_path).items():
+        for vcard in vcards:
+            if get_vcard_photo_type(vcard) == 'link':
+                uri = vcard.photo.value
+                info(file_path, str(vcard.fn.value), vcard.uid.value, uri)
     sys.exit(0)
 
 
@@ -442,26 +500,33 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(func=lambda _: parser.print_usage(file=sys.stdout))
     subparsers = parser.add_subparsers()
 
-    sp = subparsers.add_parser('fullsync')
+    sp = subparsers.add_parser('fullsync', help='Force fresh upload of all contacts to Google')
     sp.add_argument('contacts_root_dir')
     sp.set_defaults(func=cmd_fullsync)
 
     sp = subparsers.add_parser(
+        'rewritecards',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        help='Read card(s) from input_path and write them out to output_path.',
+        epilog=INPUT_OUTPUT_PATH_HELP,
+    )
+    sp.add_argument('input_path')
+    sp.add_argument('output_path')
+    sp.set_defaults(func=cmd_rewritecards)
+
+    sp = subparsers.add_parser(
         'fixphotos',
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='''
-input_path and output_path can be a file path or a directory path.  The
-behavior is as follows:
-
-    input=file, output=file -> file to file
-    input=dir,  output=file -> write all cards to one file
-    input=file, output=dir  -> write to same-named file
-    input=dir,  output=dir  -> write all files to same-named files
-    ''',
+        help='Fix photos in VCards to be compatible with iCloud',
+        epilog=INPUT_OUTPUT_PATH_HELP,
     )
     sp.add_argument('input_path')
     sp.add_argument('output_path')
     sp.set_defaults(func=cmd_fixphotos)
+
+    sp = subparsers.add_parser('test')
+    sp.add_argument('dir_path')
+    sp.set_defaults(func=cmd_test)
 
     args = parser.parse_args()
     return args
