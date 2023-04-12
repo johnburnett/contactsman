@@ -2,6 +2,10 @@ from __future__ import annotations
 import argparse
 import base64
 from collections import defaultdict
+from collections.abc import (
+    Iterable,
+    Sequence,
+)
 import itertools
 import io
 import os
@@ -40,15 +44,86 @@ If input is a directory, vcf files in all sub-dirs will be found.
 GOOGLE_SCOPES = ['https://www.googleapis.com/auth/contacts']
 GOOGLE_TOKEN_FILE_NAME = 'google_token.json'
 GOOGLE_SECRET_FILE_NAME = 'google_client_secret.json'
+GOOGLE_UPDATE_PERSON_FIELDS = (
+    'addresses',
+    'biographies',
+    'birthdays',
+    'calendarUrls',
+    'clientData',
+    'emailAddresses',
+    'events',
+    'externalIds',
+    'genders',
+    'imClients',
+    'interests',
+    'locales',
+    'locations',
+    'memberships',
+    'miscKeywords',
+    'names',
+    'nicknames',
+    'occupations',
+    'organizations',
+    'phoneNumbers',
+    'relations',
+    'sipAddresses',
+    'urls',
+    'userDefined',
+)
+GOOGLE_LOAD_PERSON_FIELDS_ALL = (
+    'addresses',
+    'ageRanges',
+    'biographies',
+    'birthdays',
+    'calendarUrls',
+    'clientData',
+    'coverPhotos',
+    'emailAddresses',
+    'events',
+    'externalIds',
+    'genders',
+    'imClients',
+    'interests',
+    'locales',
+    'locations',
+    'memberships',
+    'metadata',
+    'miscKeywords',
+    'names',
+    'nicknames',
+    'occupations',
+    'organizations',
+    'phoneNumbers',
+    'photos',
+    'relations',
+    'sipAddresses',
+    'skills',
+    'urls',
+    'userDefined',
+)
+GOOGLE_LOAD_PERSON_FIELDS_MINIMAL = (
+    'metadata',
+    'userDefined',
+)
 
 GOOGLE_BATCH_CREATE_LIMIT = 200
+GOOGLE_BATCH_UPDATE_LIMIT = 200
 GOOGLE_BATCH_DELETE_LIMIT = 500
 
 VCard = vobject.base.Component
 VCardProperty = vobject.base.ContentLine
 
 
-debug = print
+def fatal(*args, **kwargs) -> NoReturn:
+    print(*args, **kwargs)
+    sys.exit(1)
+
+
+def noop(*args, **kwargs) -> None:
+    pass
+
+
+debug = noop
 error = print
 info = print
 try:
@@ -59,12 +134,7 @@ except ImportError:
     from pprint import pprint
 
 
-def fatal(*args, **kwargs) -> NoReturn:
-    print(*args, **kwargs)
-    sys.exit(1)
-
-
-def chunks(seq: Sequence[Any], size: int) -> Iterator[list[Any]]:
+def chunks(seq: Sequence[Any], size: int) -> Iterable[list[Any]]:
     return [seq[pos : pos + size] for pos in range(0, len(seq), size)]
 
 
@@ -78,7 +148,7 @@ def read_vcards(file_path: str) -> list[VCard]:
     return vcards
 
 
-def write_vcards(file_path: str, vcards: Sequence[VCard]) -> None:
+def write_vcards(file_path: str, vcards: Iterable[VCard]) -> None:
     with open(file_path, 'w', newline='\n', encoding='utf-8') as fp:
         for vcard in vcards:
             vcard.serialize(fp)
@@ -91,6 +161,7 @@ def read_all_vcards(input_path: str) -> dict[str, list[VCard]]:
     If input_path is a file, it will read just that file.
     If input_path is a directory, it will recursively read all found vcf files.
     '''
+    info(f'Reading vCards from "{input_path}"...')
 
     def iter_input_dir(input_dir_path) -> Iterator[str]:
         assert os.path.isdir(input_dir_path)
@@ -139,6 +210,13 @@ def write_all_vcards(output_vcards: dict[str, list[VCard]], output_path: str) ->
     for output_file_path, vcards in iter_func(output_vcards, output_path):
         debug(f'Writing "{output_file_path}"')
         write_vcards(output_file_path, vcards)
+
+
+def flatten_vcards_list(all_vcards):
+    '''Return a simple list of VCards given a dict returned by read_all_vcards.'''
+    return [
+        vcard for vcard in itertools.chain.from_iterable([vcards for vcards in all_vcards.values()])
+    ]
 
 
 def get_single_param(params: dict[str, list[Any]], name: str) -> Any:
@@ -246,6 +324,7 @@ class Person:
         self.organization = ''
         self.phone_numbers: list[(str, str), ...] = []
         self.photo_bytes = b''
+        self.rev = ''
 
     @staticmethod
     def from_vcard(vcard: VCard) -> Person:
@@ -321,6 +400,13 @@ class Person:
                         photo_bytes = photo_prop.value
 
                         person.photo_bytes = photo_bytes
+                case 'rev':
+                    assert len(prop_values) == 1
+                    rev_prop = prop_values[0]
+                    assert isinstance(rev_prop.value, str)
+                    rev = rev_prop.value.strip()
+
+                    person.rev = rev
                 case 'tel':
                     for phone_prop in prop_values:
                         params = phone_prop.params
@@ -379,7 +465,10 @@ def contact_info_from_person(person: Person) -> dict[str, Any]:
     ci = {}
 
     ci['names'] = [{'unstructuredName': person.name}]
-    ci['userDefined'] = [{'key': 'uid', 'value': person.uid}]
+    ci['userDefined'] = [
+        {'key': 'uid', 'value': person.uid},
+        {'key': 'rev', 'value': person.rev},
+    ]
 
     ci['biographies'] = [{'value': person.note}]
     ci['nicknames'] = [{'value': person.nickname}]
@@ -400,14 +489,19 @@ def contact_info_from_person(person: Person) -> dict[str, Any]:
     return ci
 
 
-def load_all_google_contacts(papi: googleapiclient.discovery.Resource) -> list[dict[str, Any]]:
+def load_all_google_contacts(
+    papi: googleapiclient.discovery.Resource,
+    person_fields: Iterable[str] = GOOGLE_LOAD_PERSON_FIELDS_ALL,
+) -> list[dict[str, Any]]:
+    info(f'Loading all Google contacts...')
+
     contacts = []
     page_token = ''
     connections = papi.connections()
     while page_token is not None:
         request = connections.list(
             resourceName='people/me',
-            personFields='metadata,userDefined',
+            personFields=','.join(person_fields),
             pageToken=page_token,
         )
         response = request.execute()
@@ -417,7 +511,7 @@ def load_all_google_contacts(papi: googleapiclient.discovery.Resource) -> list[d
 
 
 def delete_google_contacts(
-    papi: googleapiclient.discovery.Resource, resource_names: Sequence[str]
+    papi: googleapiclient.discovery.Resource, resource_names: Iterable[str]
 ) -> None:
     deleted_resource_names = []
     for resource_names_chunk in chunks(resource_names, GOOGLE_BATCH_DELETE_LIMIT):
@@ -428,43 +522,113 @@ def delete_google_contacts(
 
 
 def delete_all_google_contacts(papi: googleapiclient.discovery.Resource) -> None:
-    contacts = load_all_google_contacts(papi)
+    info('Deleting all Google contacts...')
+    contacts = load_all_google_contacts(papi, person_fields=GOOGLE_LOAD_PERSON_FIELDS_MINIMAL)
     resource_names = [contact['resourceName'] for contact in contacts]
     return delete_google_contacts(papi, resource_names)
 
 
 def create_google_contacts(
-    papi: googleapiclient.discovery.Resource, persons: Sequence[Person]
+    papi: googleapiclient.discovery.Resource, persons: Iterable[Person]
 ) -> None:
     for ii, persons_chunk in enumerate(chunks(persons, GOOGLE_BATCH_CREATE_LIMIT)):
-        start_index = ii * GOOGLE_BATCH_CREATE_LIMIT
-        end_index = start_index + GOOGLE_BATCH_CREATE_LIMIT - 1
-        info(f'Creating persons {start_index}-{end_index} of {len(persons)} total persons')
         contacts = [{'contactPerson': contact_info_from_person(person)} for person in persons_chunk]
+        start_index = ii * GOOGLE_BATCH_CREATE_LIMIT
+        end_index = start_index + len(contacts) - 1
+        debug(f'Creating persons {start_index}-{end_index} of {len(persons)} total persons')
         body = {'contacts': contacts, 'readMask': 'names'}
         request = papi.batchCreateContacts(body=body)
+        response = request.execute()
+
+
+def update_google_contacts(
+    papi: googleapiclient.discovery.Resource, contacts: dict[str, dict[Any, Any]]
+) -> None:
+    for ii, resource_contacts_chunk in enumerate(
+        chunks(tuple(contacts.items()), GOOGLE_BATCH_UPDATE_LIMIT)
+    ):
+        contacts_chunk = dict(resource_contacts_chunk)
+        start_index = ii * GOOGLE_BATCH_UPDATE_LIMIT
+        end_index = start_index + len(contacts_chunk) - 1
+        debug(f'Updating persons {start_index}-{end_index} of {len(contacts_chunk)} total persons')
+        body = {
+            'contacts': contacts_chunk,
+            'updateMask': ','.join(GOOGLE_UPDATE_PERSON_FIELDS),
+        }
+        request = papi.batchUpdateContacts(body=body)
         response = request.execute()
 
 
 ################################################################################
 
 
-def cmd_fullsync(args: argparse.Namespace) -> NoReturn:
+def cmd_updategoogle(args: argparse.Namespace) -> NoReturn:
     papi = hey_papi()
-    info('Deleting contacts...', end='\n')
-    deleted_resource_names = sorted(delete_all_google_contacts(papi))
-    for name in deleted_resource_names:
-        info(name)
-    info(f'Deleted {len(deleted_resource_names)} contacts')
-    info(f'Scraping contacts from "{args.contacts_root_dir}"')
-    persons = [
+
+    all_resources = []
+    if args.force:
+        deleted_resource_names = sorted(delete_all_google_contacts(papi))
+        for name in deleted_resource_names:
+            debug(name)
+        info(f'Deleted {len(deleted_resource_names)} contacts')
+    else:
+        all_resources = load_all_google_contacts(papi)
+        info(f'Loaded {len(all_resources)} Google contacts')
+
+    all_persons = [
         Person.from_vcard(vcard)
-        for vcard in itertools.chain.from_iterable(
-            [vcards for vcards in read_all_vcards(args.contacts_root_dir).values()]
-        )
+        for vcard in flatten_vcards_list(read_all_vcards(args.vcards_root_dir))
     ]
-    info(f'Found {len(persons)} contacts')
-    create_google_contacts(papi, persons)
+    info(f'Read {len(all_persons)} vCards')
+
+    uid_to_person = {person.uid: person for person in all_persons}
+    uid_to_resource = {}
+    orphaned_resources = []
+    stale_person_uids = []
+    for contact in all_resources:
+        resource_name = contact['resourceName']
+        uid = None
+        rev = None
+        userDefined = contact.get('userDefined', [])
+        for data in userDefined:
+            match data.get('key'):
+                case 'uid':
+                    uid = data.get('value')
+                case 'rev':
+                    rev = data.get('value')
+        if uid:
+            person = uid_to_person.get(uid, None)
+            if person is None:
+                orphaned_resources.append(resource_name)
+            else:
+                if rev is None or rev != person.rev:
+                    stale_person_uids.append(uid)
+            uid_to_resource[uid] = contact
+        else:
+            orphaned_resources.append(resource_name)
+
+    new_persons = [
+        uid_to_person[person.uid] for person in all_persons if person.uid not in uid_to_resource
+    ]
+    info(f'Creating {len(new_persons)} new Google contacts')
+    create_google_contacts(papi, new_persons)
+
+    update_resources = {}
+    for uid in stale_person_uids:
+        person = uid_to_person[uid]
+        resource = uid_to_resource[uid]
+        contact_info = contact_info_from_person(person)
+        contact_info['etag'] = resource['etag']
+        contact_info['memberships'] = [
+            {'contactGroupMembership': {'contactGroupResourceName': 'contactGroups/myContacts'}}
+        ]
+        update_resources[resource['resourceName']] = contact_info
+    info(f'Updating {len(update_resources)} Google contacts')
+    update_google_contacts(papi, update_resources)
+
+    info(f'Deleting {len(orphaned_resources)} orphaned Google contacts')
+    delete_google_contacts(papi, orphaned_resources)
+
     sys.exit(0)
 
 
@@ -488,22 +652,28 @@ def cmd_fixphotos(args: argparse.Namespace) -> NoReturn:
 
 
 def cmd_test(args: argparse.Namespace) -> NoReturn:
-    for file_path, vcards in read_all_vcards(args.dir_path).items():
-        for vcard in vcards:
-            if get_vcard_photo_type(vcard) == 'link':
-                uri = vcard.photo.value
-                info(file_path, str(vcard.fn.value), vcard.uid.value, uri)
+    papi = hey_papi()
+    contacts = load_all_google_contacts(papi)
+    contact = contacts[0]
+    pprint(contact)
     sys.exit(0)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument('-v', '--verbose', action='store_true')
     parser.set_defaults(func=lambda _: parser.print_usage(file=sys.stdout))
     subparsers = parser.add_subparsers()
 
-    sp = subparsers.add_parser('fullsync', help='Force fresh upload of all contacts to Google')
-    sp.add_argument('contacts_root_dir')
-    sp.set_defaults(func=cmd_fullsync)
+    sp = subparsers.add_parser('updategoogle', help='Update google contacts from vCards')
+    sp.add_argument('vcards_root_dir')
+    sp.add_argument(
+        '-f',
+        '--force',
+        action='store_true',
+        help='Delete all Google contacts first and force a full re-upload',
+    )
+    sp.set_defaults(func=cmd_updategoogle)
 
     sp = subparsers.add_parser(
         'rewritecards',
@@ -526,7 +696,6 @@ def parse_args() -> argparse.Namespace:
     sp.set_defaults(func=cmd_fixphotos)
 
     sp = subparsers.add_parser('test')
-    sp.add_argument('dir_path')
     sp.set_defaults(func=cmd_test)
 
     args = parser.parse_args()
@@ -534,24 +703,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> NoReturn:
-    ############################################################################
-    # Map from a vcard UID to google resource name, if we ever want to mess
-    # with gently updating existing contacts vs existing lazy scorched earth
-    # delete-then-create method being used now.
-
-    # contacts = load_all_google_contacts(papi)
-    # uid_to_resource = {}
-    # for contact in contacts:
-    #     uid = None
-    #     userDefined = contact.get('userDefined', [])
-    #     for data in userDefined:
-    #         if data.get('key') == 'uid':
-    #             uid = data.get('value')
-    #             break
-    #     if uid:
-    #         uid_to_resource[uid] = contact['resourceName']
-    # all_uids = set([person.uid for person in persons])
-
     ############################################################################
     # Example of how to update a contact photo.  Non-batched, not worth sync'ing
     # to google for now.
@@ -569,6 +720,9 @@ def main() -> NoReturn:
     #         response = request.execute()
 
     args = parse_args()
+    if args.verbose:
+        global debug
+        debug = info
     args.func(args)
 
 
