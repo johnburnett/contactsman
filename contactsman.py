@@ -191,6 +191,7 @@ def write_all_vcards(output_vcards: dict[str, list[VCard]], output_path: str) ->
     file in the directory with a name that matches the filename it was
     originally read from.
     '''
+    info(f'Writing vCards to "{output_path}"...')
 
     def iter_output_dir(
         output_vcards: dict[str, list[VCard]], output_dir_path: str
@@ -641,11 +642,31 @@ def cmd_rewritecards(args: argparse.Namespace) -> NoReturn:
 def cmd_fixphotos(args: argparse.Namespace) -> NoReturn:
     input_vcards = read_all_vcards(args.input_path)
 
+    numchanged = 1
     for input_file_path, vcards in input_vcards.items():
         for vcard in vcards:
             if get_vcard_photo_type(vcard) == 'inline':
                 if fix_card_photo(vcard.photo):
                     info('optimized', vcard.fn.value)
+                    numchanged += 1
+    info(f'Updated {numchanged} vCards')
+
+    write_all_vcards(input_vcards, args.output_path)
+    sys.exit(0)
+
+
+def cmd_newuids(args: argparse.Namespace) -> NoReturn:
+    input_vcards = read_all_vcards(args.input_path)
+
+    numchanged = 1
+    for input_file_path, vcards in input_vcards.items():
+        for vcard in vcards:
+            olduid = vcard.uid.value.strip()
+            newuid = str(uuid.uuid4())
+            vcard.uid.value = newuid
+            debug(f'{olduid} -> {newuid}')
+            numchanged += 1
+    info(f'Updated {numchanged} vCards')
 
     write_all_vcards(input_vcards, args.output_path)
     sys.exit(0)
@@ -688,12 +709,22 @@ def parse_args() -> argparse.Namespace:
     sp = subparsers.add_parser(
         'fixphotos',
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        help='Fix photos in VCards to be compatible with iCloud',
+        help='Fix photos in vCards to be compatible with iCloud',
         epilog=INPUT_OUTPUT_PATH_HELP,
     )
     sp.add_argument('input_path')
     sp.add_argument('output_path')
     sp.set_defaults(func=cmd_fixphotos)
+
+    sp = subparsers.add_parser(
+        'newuids',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        help='Give all vCards a new UID',
+        epilog=INPUT_OUTPUT_PATH_HELP,
+    )
+    sp.add_argument('input_path')
+    sp.add_argument('output_path')
+    sp.set_defaults(func=cmd_newuids)
 
     sp = subparsers.add_parser('test')
     sp.set_defaults(func=cmd_test)
