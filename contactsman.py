@@ -18,9 +18,18 @@ from typing import (
 )
 import uuid
 
+from rich import (
+    inspect,
+    traceback,
+)
+from rich.pretty import pprint
+
+traceback.install(show_locals=True)
+
 from PIL import Image
 from google.auth.transport.requests import Request
 import googleapiclient.discovery
+import googleapiclient.errors
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 import vobject
@@ -126,12 +135,6 @@ def noop(*args, **kwargs) -> None:
 debug = noop
 error = print
 info = print
-try:
-    from rich import inspect
-    from rich.pretty import pprint
-except ImportError:
-    inspect = debug
-    from pprint import pprint
 
 
 def chunks(seq: Sequence[Any], size: int) -> Iterable[list[Any]]:
@@ -490,9 +493,28 @@ def contact_info_from_person(person: Person) -> dict[str, Any]:
     return ci
 
 
+def execute_request(request: googleapiclient.http.HttpRequest) -> Any:
+    return request.execute(num_retries=3)
+    # arbitrary, and number of tries is (len(backoff_times) + 1)
+    # backoff_times = (
+    #     0.1,
+    #     0.5,
+    #     2.0,
+    # )
+    # for ii, backoff_time in enumerate(backoff_times):
+    #     try:
+    #         result = request.execute()
+    #         return result
+    #     except googleapiclient.errors.HttpError as ex:
+    #         if ex.resp.status == 503:
+    #             if ii == len(backoff_times):
+    #                 raise
+    #             time.sleep(backoff_time)
+
+
 def load_all_google_contacts(
     papi: googleapiclient.discovery.Resource,
-    person_fields: Iterable[str] = GOOGLE_LOAD_PERSON_FIELDS_ALL,
+    person_fields: Iterable[str] = GOOGLE_LOAD_PERSON_FIELDS_MINIMAL,
 ) -> list[dict[str, Any]]:
     info(f'Loading all Google contacts...')
 
@@ -505,7 +527,7 @@ def load_all_google_contacts(
             personFields=','.join(person_fields),
             pageToken=page_token,
         )
-        response = request.execute()
+        response = execute_request(request)
         page_token = response.get('nextPageToken', None)
         contacts.extend(response.get('connections', []))
     return contacts
@@ -517,14 +539,14 @@ def delete_google_contacts(
     deleted_resource_names = []
     for resource_names_chunk in chunks(resource_names, GOOGLE_BATCH_DELETE_LIMIT):
         request = papi.batchDeleteContacts(body={'resourceNames': resource_names_chunk})
-        response = request.execute()
+        response = execute_request(request)
         deleted_resource_names.extend(resource_names_chunk)
     return deleted_resource_names
 
 
 def delete_all_google_contacts(papi: googleapiclient.discovery.Resource) -> None:
     info('Deleting all Google contacts...')
-    contacts = load_all_google_contacts(papi, person_fields=GOOGLE_LOAD_PERSON_FIELDS_MINIMAL)
+    contacts = load_all_google_contacts(papi)
     resource_names = [contact['resourceName'] for contact in contacts]
     return delete_google_contacts(papi, resource_names)
 
@@ -539,7 +561,7 @@ def create_google_contacts(
         debug(f'Creating persons {start_index}-{end_index} of {len(persons)} total persons')
         body = {'contacts': contacts, 'readMask': 'names'}
         request = papi.batchCreateContacts(body=body)
-        response = request.execute()
+        response = execute_request(request)
 
 
 def update_google_contacts(
@@ -557,7 +579,7 @@ def update_google_contacts(
             'updateMask': ','.join(GOOGLE_UPDATE_PERSON_FIELDS),
         }
         request = papi.batchUpdateContacts(body=body)
-        response = request.execute()
+        response = execute_request(request)
 
 
 ################################################################################
@@ -642,7 +664,7 @@ def cmd_rewritecards(args: argparse.Namespace) -> NoReturn:
 def cmd_fixphotos(args: argparse.Namespace) -> NoReturn:
     input_vcards = read_all_vcards(args.input_path)
 
-    numchanged = 1
+    numchanged = 0
     for input_file_path, vcards in input_vcards.items():
         for vcard in vcards:
             if get_vcard_photo_type(vcard) == 'inline':
@@ -651,7 +673,8 @@ def cmd_fixphotos(args: argparse.Namespace) -> NoReturn:
                     numchanged += 1
     info(f'Updated {numchanged} vCards')
 
-    write_all_vcards(input_vcards, args.output_path)
+    if numchanged > 0:
+        write_all_vcards(input_vcards, args.output_path)
     sys.exit(0)
 
 
@@ -674,9 +697,13 @@ def cmd_newuids(args: argparse.Namespace) -> NoReturn:
 
 def cmd_test(args: argparse.Namespace) -> NoReturn:
     papi = hey_papi()
-    contacts = load_all_google_contacts(papi)
-    contact = contacts[0]
-    pprint(contact)
+    connections = papi.connections()
+    request = connections.list(
+        resourceName='people/me',
+        personFields=','.join(GOOGLE_LOAD_PERSON_FIELDS_MINIMAL),
+    )
+    response = execute_request(request)
+    pprint(response)
     sys.exit(0)
 
 
