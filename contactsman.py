@@ -438,25 +438,33 @@ class Person:
 ################################################################################
 
 
-def get_google_credentials() -> Optional[Credentials]:
+def get_google_credentials(force_auth: bool = False) -> Optional[Credentials]:
     creds = None
     token_file_path = os.path.join(THIS_DIR_PATH, GOOGLE_TOKEN_FILE_NAME)
-    if os.path.exists(token_file_path):
-        creds = Credentials.from_authorized_user_file(token_file_path, GOOGLE_SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            secrets_file_path = os.path.join(THIS_DIR_PATH, GOOGLE_SECRET_FILE_NAME)
-            flow = InstalledAppFlow.from_client_secrets_file(secrets_file_path, GOOGLE_SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open(token_file_path, 'w', encoding='utf-8') as fp:
-            fp.write(creds.to_json())
+
+    if not force_auth:
+        if os.path.exists(token_file_path):
+            creds = Credentials.from_authorized_user_file(token_file_path, GOOGLE_SCOPES)
+            if creds:
+                if not creds.valid or (creds.expired and creds.refresh_token):
+                    try:
+                        creds.refresh(Request())
+                    except:
+                        creds = None
+
+    if not creds:
+        secrets_file_path = os.path.join(THIS_DIR_PATH, GOOGLE_SECRET_FILE_NAME)
+        flow = InstalledAppFlow.from_client_secrets_file(secrets_file_path, GOOGLE_SCOPES)
+        creds = flow.run_local_server(port=0)
+
+    with open(token_file_path, 'w', encoding='utf-8') as fp:
+        fp.write(creds.to_json())
+
     return creds
 
 
-def hey_papi() -> googleapiclient.discovery.Resource:
-    creds = get_google_credentials()
+def hey_papi(force_auth: bool = False) -> googleapiclient.discovery.Resource:
+    creds = get_google_credentials(force_auth=force_auth)
     if not creds:
         fatal('Unable to get Google credentials')
     service = googleapiclient.discovery.build('people', 'v1', credentials=creds)
@@ -695,6 +703,15 @@ def cmd_newuids(args: argparse.Namespace) -> NoReturn:
     sys.exit(0)
 
 
+def cmd_testgoogleauth(args: argparse.Namespace) -> NoReturn:
+    try:
+        papi = hey_papi(force_auth=args.force)
+        info(f'Successfully authenticated.')
+        sys.exit(0)
+    except Exception as ex:
+        fatal(f'Error authenticating: {ex!r}')
+
+
 def cmd_test(args: argparse.Namespace) -> NoReturn:
     papi = hey_papi()
     connections = papi.connections()
@@ -722,6 +739,17 @@ def parse_args() -> argparse.Namespace:
         help='Delete all Google contacts first and force a full re-upload',
     )
     sp.set_defaults(func=cmd_updategoogle)
+
+    sp = subparsers.add_parser(
+        'testgoogleauth', help='Authenticate with google and test we have access to contacts'
+    )
+    sp.add_argument(
+        '-f',
+        '--force',
+        action='store_true',
+        help="Force authentication flow (don't use cached auth tokens if they exist)",
+    )
+    sp.set_defaults(func=cmd_testgoogleauth)
 
     sp = subparsers.add_parser(
         'rewritecards',
