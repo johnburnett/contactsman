@@ -9,6 +9,7 @@ from collections.abc import (
 import itertools
 import io
 import os
+import re
 import sys
 from typing import (
     Any,
@@ -301,6 +302,42 @@ def fix_card_photo(photo_prop: VCardProperty) -> bool:
             photo_prop.params.pop('TYPE')
         photo_prop.params['TYPE'] = ['jpeg']
         return True
+
+
+def normalize_tel_for_imessage(tel):
+    # "good enough for me" phone normalization to match whatever imessage-exporter is doing
+    phone_res = (
+        re.compile(
+            r'\+?1(?P<area_code>\d{3})\s*-?\s*(?P<prefix>\d{3})\s*-?\s*(?P<line>\d{4})[^\d]*.*'
+        ),
+        re.compile(
+            r'(\+1\s*)?\((?P<area_code>\d{3})\)\s*(?P<prefix>\d{3})\s*-?\s*(?P<line>\d{4})[^\d]*.*'
+        ),
+        re.compile(
+            r'(\+1\s*-\s*)?(?P<area_code>\d{3})\s*-?\s*(?P<prefix>\d{3})\s*-?\s*(?P<line>\d{4})[^\d]*.*'
+        ),
+    )
+    for phone_re in phone_res:
+        match = phone_re.search(tel)
+        if match:
+            return f"+1{match.group('area_code')}{match.group('prefix')}{match.group('line')}"
+    return tel
+
+
+def test_normalize_tel_for_imessage():
+    re_tests = (
+        ("+1 (987) 654-0123", "+19876540123"),
+        ("+1(987)6540123", "+19876540123"),
+        ("(987) 6540123", "+19876540123"),
+        ("+1-987-654-0123", "+19876540123"),
+        ("987 654-0123", "+19876540123"),
+        ("9876540123", "+19876540123"),
+        ("+19876540123", "+19876540123"),
+        ("19876540123", "+19876540123"),
+    )
+    for input_value, expected_value in re_tests:
+        result = normalize_tel_for_imessage(input_value)
+        assert expected_value == result
 
 
 class Person:
@@ -703,6 +740,74 @@ def cmd_newuids(args: argparse.Namespace) -> NoReturn:
     sys.exit(0)
 
 
+def cmd_imessagefixup(args: argparse.Namespace) -> NoReturn:
+    detail_types = ('email', 'tel')
+
+    detail_to_name = {}
+    input_vcards = flatten_vcards_list(read_all_vcards(args.vcards_dir))
+    for vcard in input_vcards:
+        names = vcard.contents.get('fn')
+        if not names:
+            continue
+        name = names[0].value.strip()
+        if not name:
+            continue
+
+        for detail_type in detail_types:
+            details = vcard.contents.get(detail_type, [])
+            for detail in details:
+                detail_value = detail.value.strip()
+                if detail_type == 'tel':
+                    detail_value = normalize_tel_for_imessage(detail_value)
+                assert detail_value
+                detail_to_name[detail_value] = name
+
+    seen_targets = defaultdict(int)
+    renames = []
+    with os.scandir(args.imessages_dir) as sd:
+        for item in sd:
+            if not item.is_file():
+                continue
+            source_file_name, file_type = os.path.splitext(item.name)
+            if file_type.casefold() != '.html':
+                continue
+            source_participants = source_file_name.split(', ')
+            named_participants = [detail_to_name.get(part, part) for part in source_participants]
+            for part in named_participants:
+                assert part
+            target_file_name = ', '.join(named_participants)
+            if source_file_name != target_file_name:
+                seen_targets[target_file_name] += 1
+                if seen_targets[target_file_name] > 1:
+                    target_file_name += f'({seen_targets[target_file_name]})'
+                renames.append((item.name, target_file_name + '.html'))
+
+    sender_re = re.compile(
+        r'(?P<prefix>.*<span class="sender">)(?P<sender>.*)(?P<postfix></span></p>.*)'
+    )
+    info(f'Updating {len(renames)} files...')
+    for source_file_name, target_file_name in renames:
+        source_file_path = os.path.join(args.imessages_dir, source_file_name)
+        target_file_path = os.path.join(args.imessages_dir, target_file_name)
+        debug(f'rename "{source_file_path}"')
+        debug(f'       "{target_file_path}"')
+        with open(source_file_path, encoding='utf-8') as fIn:
+            with open(target_file_path, 'w', encoding='utf-8') as fOut:
+                for line in fIn:
+                    match = sender_re.match(line)
+                    if match:
+                        sender = match.group('sender')
+                        name = detail_to_name.get(sender, None)
+                        if name:
+                            line = (
+                                f"{match.group('prefix')}{name} ({sender}){match.group('postfix')}"
+                            )
+                    fOut.write(line)
+        os.unlink(source_file_path)
+
+    sys.exit(0)
+
+
 def cmd_testgoogleauth(args: argparse.Namespace) -> NoReturn:
     try:
         papi = hey_papi(force_auth=args.force)
@@ -780,6 +885,15 @@ def parse_args() -> argparse.Namespace:
     sp.add_argument('input_path')
     sp.add_argument('output_path')
     sp.set_defaults(func=cmd_newuids)
+
+    sp = subparsers.add_parser(
+        'imessagefixup',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        help=r'Fixup imessage-exporter files to match vCard contact names',
+    )
+    sp.add_argument('vcards_dir')
+    sp.add_argument('imessages_dir')
+    sp.set_defaults(func=cmd_imessagefixup)
 
     sp = subparsers.add_parser('test')
     sp.set_defaults(func=cmd_test)
