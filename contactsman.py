@@ -36,8 +36,6 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 import vobject
 
 
-THIS_DIR_PATH = os.path.dirname(os.path.normpath(__file__))
-
 INPUT_OUTPUT_PATH_HELP = '''
 input_path and output_path can be a file path or a directory path.
 Cards will be combined into a single file or split apart into multiple
@@ -51,9 +49,12 @@ files as needed.  The behavior is as follows:
 If input is a directory, vcf files in all sub-dirs will be found.
 '''
 
+CONTACTSMAN_SECRETS_DIR = os.environ.get(
+    'CONTACTSMAN_SECRETS_DIR', os.path.dirname(os.path.normpath(__file__))
+)
+GOOGLE_TOKEN_FILE_NAME = 'contactsman_google_token.json'
+GOOGLE_SECRET_FILE_NAME = 'contactsman_google_client_secret.json'
 GOOGLE_SCOPES = ['https://www.googleapis.com/auth/contacts']
-GOOGLE_TOKEN_FILE_NAME = 'google_token.json'
-GOOGLE_SECRET_FILE_NAME = 'google_client_secret.json'
 GOOGLE_UPDATE_PERSON_FIELDS = (
     'addresses',
     'biographies',
@@ -477,7 +478,7 @@ class Person:
 
 def get_google_credentials(force_auth: bool = False) -> Optional[Credentials]:
     creds = None
-    token_file_path = os.path.join(THIS_DIR_PATH, GOOGLE_TOKEN_FILE_NAME)
+    token_file_path = os.path.join(CONTACTSMAN_SECRETS_DIR, GOOGLE_TOKEN_FILE_NAME)
 
     if not force_auth:
         if os.path.exists(token_file_path):
@@ -490,7 +491,7 @@ def get_google_credentials(force_auth: bool = False) -> Optional[Credentials]:
                         creds = None
 
     if not creds:
-        secrets_file_path = os.path.join(THIS_DIR_PATH, GOOGLE_SECRET_FILE_NAME)
+        secrets_file_path = os.path.join(CONTACTSMAN_SECRETS_DIR, GOOGLE_SECRET_FILE_NAME)
         flow = InstalledAppFlow.from_client_secrets_file(secrets_file_path, GOOGLE_SCOPES)
         creds = flow.run_local_server(port=0)
 
